@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-s20: Comprehensive Agent — all teaching components in one loop.
 
-Run:  python s20_comprehensive/code.py
-Need: pip install anthropic python-dotenv pyyaml + .env with ANTHROPIC_API_KEY
-
-This final chapter intentionally puts the earlier teaching mechanisms back
-together: dispatch, permission, hooks, todo, subagent, skills, compaction,
-memory, prompt assembly, error recovery, task graph, background tasks, cron,
-teams, protocols, autonomous agents, worktrees, and MCP.
-"""
 
 import ast, json, os, subprocess, time, random, threading, re, sys
 from pathlib import Path
@@ -27,7 +17,14 @@ except ImportError:
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+try:
+    load_dotenv(override=True, encoding="utf-8")
+except Exception:
+    try:
+        # 兼容 GBK 编码保存的 .env（中文 Windows 常见）
+        load_dotenv(override=True, encoding="gbk")
+    except Exception:
+        pass
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
@@ -51,21 +48,180 @@ CONTEXT_LIMIT = 50000
 KEEP_RECENT_TOOL_RESULTS = 3
 PERSIST_THRESHOLD = 30000
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
-PROMPT = "\033[36mruncode >> \033[0m"
+PROMPT = "\033[36m› \033[0m"
 CLI_ACTIVE = False
 
+# ── Encoding Helpers ──
+#
+# 乱码的根源是编码不一致：中文 Windows 上 Python 的 stdio 和默认文件编码是
+# cp936/GBK，而模型 API、git 和多数工具都是 UTF-8。这里做统一约定——
+# 内部状态文件一律按 UTF-8 写入；读取时容忍遗留的 GBK 内容；子进程输出用
+# UTF-8→locale 的容错顺序解码；控制台尽量切换到 UTF-8。
+
+ENCODING = "utf-8"
+
+
+def decode_bytes(data: bytes) -> str:
+    """按 UTF-8 解码，失败时回退到遗留的本地编码（如中文 Windows 的 GBK）。"""
+    if not data:
+        return ""
+    try:
+        return data.decode(ENCODING)
+    except UnicodeDecodeError:
+        pass
+    for enc in ("gbk", "cp1252", "latin-1"):
+        try:
+            return data.decode(enc, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode(ENCODING, errors="replace")
+
+
+def read_utf8(path: Path) -> str:
+    """按 UTF-8 读取文件，容忍 BOM 与遗留 GBK 编码内容。"""
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    return decode_bytes(data)
+
+
+def write_utf8(path: Path, text: str) -> None:
+    """以 UTF-8 写入文件——内部状态文件的唯一规范编码。"""
+    path.write_text(text, encoding=ENCODING)
+
+
+def setup_console():
+    """让 stdio 对 Unicode 健壮；Windows 上同时把控制台代码页切到 UTF-8(65001)，
+    使中文与表情符号在输入输出两个方向都不会乱码。"""
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleOutputCP(65001)
+            kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            stream.reconfigure(encoding=ENCODING, errors="replace")
+        except Exception:
+            pass
+
+
+# 导入即生效，覆盖启动阶段（如 cron 调度线程）的任何输出
+setup_console()
+
+# ── Token Tracking ──
+
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    thinking_tokens: int = 0
+
+    def add(self, usage) -> None:
+        self.input_tokens += getattr(usage, 'input_tokens', 0) or 0
+        self.output_tokens += getattr(usage, 'output_tokens', 0) or 0
+        self.cache_creation_input_tokens += getattr(usage, 'cache_creation_input_tokens', 0) or 0
+        self.cache_read_input_tokens += getattr(usage, 'cache_read_input_tokens', 0) or 0
+        self.thinking_tokens += getattr(usage, 'thinking_tokens', 0) or 0
+
+    def format_last(self, usage) -> str:
+        """Format a single API response's token usage."""
+        inp = getattr(usage, 'input_tokens', 0) or 0
+        out = getattr(usage, 'output_tokens', 0) or 0
+        parts = [f"\033[33m↑{inp}\033[0m", f"\033[36m↓{out}\033[0m"]
+        cc = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+        cr = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        if cc:
+            parts.append(f"\033[35m+{cc}C\033[0m")
+        if cr:
+            parts.append(f"\033[35m+{cr}R\033[0m")
+        th = getattr(usage, 'thinking_tokens', 0) or 0
+        if th:
+            parts.append(f"\033[2m~{th}T\033[0m")
+        total = inp - cr - cc + out  # 实际新增消耗
+        parts.append(f"\033[90m={total}\033[0m")
+        return " ".join(parts)
+
+    def format_total(self) -> str:
+        """Format accumulated token usage."""
+        total_input = self.input_tokens - self.cache_read_input_tokens - self.cache_creation_input_tokens
+        parts = [f"\033[33m↑{self.input_tokens}\033[0m", f"\033[36m↓{self.output_tokens}\033[0m"]
+        if self.cache_creation_input_tokens:
+            parts.append(f"\033[35m+{self.cache_creation_input_tokens}C\033[0m")
+        if self.cache_read_input_tokens:
+            parts.append(f"\033[35m+{self.cache_read_input_tokens}R\033[0m")
+        if self.thinking_tokens:
+            parts.append(f"\033[2m~{self.thinking_tokens}T\033[0m")
+        parts.append(f"\033[90m={total_input + self.output_tokens}\033[0m")
+        return " ".join(parts)
+
+_SESSION_TOKENS = TokenUsage()
+
 # ── UI Styling ──
+#
+# 终端界面风格向 Claude Code 看齐：极简提示符 ›、树状工具调用（└ (N)）、
+# 统一的分隔线与状态行。全部基于 ANSI 颜色 + 方框字符，Windows Terminal
+# 可直接显示（控制台已在 setup_console 切到 UTF-8）。
 
 SECTION_WIDTH = 60
 TURN_COUNTER = 0
 _SESSION_START = time.time()
 
+# 每个工具对应的「字形 + 颜色」，树状展示时一眼可辨识工具类型。
+TOOL_GLYPHS = {
+    "bash":            ("$",  "\033[33m"),  # 琥珀
+    "read_file":       ("◎",  "\033[36m"),  # 青
+    "write_file":      ("✎",  "\033[35m"),  # 品红
+    "edit_file":       ("✎",  "\033[35m"),
+    "glob":            ("◎",  "\033[36m"),
+    "todo_write":      ("✓",  "\033[32m"),  # 绿
+    "task":            ("✦",  "\033[34m"),  # 蓝
+    "load_skill":      ("✦",  "\033[34m"),
+    "create_task":     ("✦",  "\033[34m"),
+    "list_tasks":      ("✦",  "\033[34m"),
+    "get_task":        ("✦",  "\033[34m"),
+    "claim_task":      ("✦",  "\033[34m"),
+    "complete_task":   ("✦",  "\033[34m"),
+    "compact":         ("↻",  "\033[36m"),
+    "schedule_cron":   ("◷",  "\033[35m"),
+    "list_crons":      ("◷",  "\033[35m"),
+    "cancel_cron":     ("◷",  "\033[35m"),
+    "spawn_teammate":  ("◈",  "\033[35m"),
+    "send_message":    ("◈",  "\033[35m"),
+    "check_inbox":     ("◈",  "\033[35m"),
+    "create_worktree": ("⎇",  "\033[33m"),
+    "remove_worktree": ("⎇",  "\033[33m"),
+    "keep_worktree":   ("⎇",  "\033[33m"),
+    "connect_mcp":     ("⇄",  "\033[34m"),
+}
+_DEFAULT_GLYPH = ("▸", "\033[36m")
 
-def ui_separator(title: str = "", char: str = "-") -> str:
-    """Return a section divider line with optional centered title."""
+
+def _display_width(text: str) -> int:
+    """按终端显示宽度计算长度：中文等全角字符占 2 列，用于居中对齐。"""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in text)
+
+
+def ui_separator(title: str = "", char: str = "─") -> str:
+    """Return a section divider line, optional centered title."""
     if title:
-        side = char * ((SECTION_WIDTH - len(title) - 2) // 2)
-        return f"\033[90m{side} {title} {side}\033[0m"
+        label = f" {title} "
+        label_w = _display_width(label)
+        side = (SECTION_WIDTH - label_w) // 2
+        left = char * side
+        right = char * (SECTION_WIDTH - label_w - side)
+        return f"\033[90m{left}{label}{right}\033[0m"
     return f"\033[90m{char * SECTION_WIDTH}\033[0m"
 
 
@@ -85,12 +241,81 @@ def ui_duration(seconds: float) -> str:
 def ui_session_stats() -> str:
     """Return session statistics string."""
     elapsed = time.time() - _SESSION_START
-    return f"回合: {TURN_COUNTER}  耗时: {ui_duration(elapsed)}"
+    parts = [f"回合 {TURN_COUNTER}", f"耗时 {ui_duration(elapsed)}"]
+    if _SESSION_TOKENS.input_tokens or _SESSION_TOKENS.output_tokens:
+        parts.append(_SESSION_TOKENS.format_total())
+    return "  \033[2m" + "  ".join(parts) + "\033[0m"
 
 
 def ui_prompt() -> str:
-    """Return the colored prompt string with turn number."""
-    return f"\033[36m[#{TURN_COUNTER}] runcode >> \033[0m"
+    """Return the colored prompt string（Claude Code 风格 ›）。"""
+    return PROMPT
+
+
+def ui_continuation_prompt() -> str:
+    """Multi-line continuation prompt."""
+    return "\033[2m· \033[0m"
+
+
+def ui_log_text(tag: str, text: str, color: str = "\033[90m") -> str:
+    """统一事件日志行文本，风格与树状工具调用一致：┆ tag 内容"""
+    return f"  \033[90m┆\033[0m {color}{tag}\033[0m {text}"
+
+
+def ui_log(tag: str, text: str, color: str = "\033[90m") -> None:
+    """打印统一事件日志行。"""
+    print(ui_log_text(tag, text, color))
+
+
+def _tool_arg_summary(name: str, args: dict) -> str:
+    """Short one-line summary of a tool call's main argument."""
+    args = args or {}
+    if name == "bash":
+        return args.get("command", "")
+    if name in ("read_file", "write_file", "edit_file"):
+        return args.get("path", "")
+    if name == "glob":
+        return args.get("pattern", "")
+    if name == "load_skill":
+        return args.get("name", "")
+    if name == "connect_mcp":
+        return args.get("name", "")
+    if name == "task":
+        return args.get("description", "")
+    return ""
+
+
+def ui_tool_call(index: int, name: str, args: dict) -> str:
+    """树状工具调用行：└ (1) $ bash  <命令>"""
+    glyph, color = TOOL_GLYPHS.get(name, _DEFAULT_GLYPH)
+    line = (f"  \033[90m└\033[0m \033[90m({index})\033[0m "
+            f"{color}{glyph} {name}\033[0m")
+    desc = _tool_arg_summary(name, args)
+    if desc:
+        line += f"  \033[2m{desc}\033[0m"
+    return line
+
+
+def ui_tool_output(output, max_lines: int = 6) -> None:
+    """在工具行下方缩进打印输出预览（折叠预览，超出部分省略）。"""
+    preview = str(output).strip()
+    if not preview:
+        return
+    lines = preview.splitlines()
+    for ln in lines[:max_lines]:
+        print(f"      \033[90m│\033[0m {ln}")
+    remaining = len(lines) - max_lines
+    if remaining > 0:
+        print(f"      \033[90m│\033[0m \033[2m… {remaining} 行省略\033[0m")
+
+
+def ui_turn_footer(elapsed: float) -> str:
+    """回合结束行：✓ 完成 + 耗时 + 累计 token。"""
+    parts = [f"\033[32m✓\033[0m \033[2m完成\033[0m",
+             f"\033[2m{ui_duration(elapsed)}\033[0m"]
+    if _SESSION_TOKENS.input_tokens > 0:
+        parts.append(f"\033[2m{_SESSION_TOKENS.format_total()}\033[0m")
+    return "  " + "  ".join(parts)
 
 
 def terminal_print(text: str):
@@ -150,15 +375,15 @@ def create_task(subject: str, description: str = "",
 
 
 def save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+    write_utf8(_task_path(task.id), json.dumps(asdict(task), indent=2))
 
 
 def load_task(task_id: str) -> Task:
-    return Task(**json.loads(_task_path(task_id).read_text()))
+    return Task(**json.loads(read_utf8(_task_path(task_id))))
 
 
 def list_tasks() -> list[Task]:
-    return [Task(**json.loads(p.read_text()))
+    return [Task(**json.loads(read_utf8(p)))
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
@@ -195,7 +420,7 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
-    print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
+    ui_log("claim", f"{task.subject} → in_progress", "\033[36m")
     return f"Claimed {task.id} ({task.subject})"
 
 
@@ -207,7 +432,7 @@ def complete_task(task_id: str) -> str:
     save_task(task)
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
-    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+    ui_log("complete", f"{task.subject} ✓", "\033[32m")
     msg = f"Completed {task.id} ({task.subject})"
     if unblocked:
         msg += f"\nUnblocked: {', '.join(unblocked)}"
@@ -238,8 +463,8 @@ def validate_worktree_name(name: str) -> str | None:
 def run_git(args: list[str]) -> tuple[bool, str]:
     try:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=30)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, timeout=30)
+        out = decode_bytes(r.stdout + r.stderr).strip()
         return r.returncode == 0, out[:5000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return False, "Error: git timeout"
@@ -249,7 +474,7 @@ def log_event(event_type: str, worktree_name: str, task_id: str = ""):
     event = {"type": event_type, "worktree": worktree_name,
              "task_id": task_id, "ts": time.time()}
     events_file = WORKTREES_DIR / "events.jsonl"
-    with open(events_file, "a") as f:
+    with open(events_file, "a", encoding=ENCODING) as f:
         f.write(json.dumps(event) + "\n")
 
 
@@ -273,7 +498,7 @@ def create_worktree(name: str, task_id: str = "") -> str:
     if task_id:
         bind_task_to_worktree(task_id, name)
     log_event("create", name, task_id)
-    print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
+    ui_log("worktree", f"created: {name} at {path}", "\033[33m")
     return f"Worktree '{name}' created at {path}"
 
 
@@ -286,11 +511,13 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
 def _count_worktree_changes(path: Path) -> tuple[int, int]:
     try:
         r1 = subprocess.run(["git", "status", "--porcelain"],
-                            cwd=path, capture_output=True, text=True, timeout=10)
-        files = len([l for l in r1.stdout.strip().splitlines() if l.strip()])
+                            cwd=path, capture_output=True, timeout=10)
+        files = len([l for l in decode_bytes(r1.stdout).strip().splitlines()
+                     if l.strip()])
         r2 = subprocess.run(["git", "log", "@{push}..HEAD", "--oneline"],
-                            cwd=path, capture_output=True, text=True, timeout=10)
-        commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
+                            cwd=path, capture_output=True, timeout=10)
+        commits = len([l for l in decode_bytes(r2.stdout).strip().splitlines()
+                       if l.strip()])
         return files, commits
     except Exception:
         return -1, -1
@@ -315,7 +542,7 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
         return f"Failed to remove worktree '{name}'"
     run_git(["branch", "-D", f"wt/{name}"])
     log_event("remove", name)
-    print(f"  \033[33m[worktree] removed: {name}\033[0m")
+    ui_log("worktree", f"removed: {name}", "\033[33m")
     return f"Worktree '{name}' removed"
 
 
@@ -355,7 +582,7 @@ def scan_skills():
         manifest = directory / "SKILL.md"
         if not manifest.exists():
             continue
-        raw = manifest.read_text()
+        raw = read_utf8(manifest)
         meta, _ = _parse_frontmatter(raw)
         name = meta.get("name", directory.name)
         desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
@@ -436,8 +663,8 @@ def run_bash(command: str, cwd: Path = None,
     # run_in_background is consumed by the dispatcher; direct execution ignores it.
     try:
         r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, timeout=120)
+        out = decode_bytes(r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
@@ -446,7 +673,7 @@ def run_bash(command: str, cwd: Path = None,
 def run_read(path: str, limit: int | None = None,
              offset: int = 0, cwd: Path = None) -> str:
     try:
-        lines = safe_path(path, cwd).read_text(encoding="utf-8").splitlines()
+        lines = read_utf8(safe_path(path, cwd)).splitlines()
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         lines = lines[offset:]
@@ -461,8 +688,8 @@ def run_write(path: str, content: str, cwd: Path = None) -> str:
     try:
         fp = safe_path(path, cwd)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding="utf-8")
-        return f"Wrote {len(content)} bytes to {path}"
+        write_utf8(fp, content)
+        return f"Wrote {len(content.encode(ENCODING))} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -471,10 +698,10 @@ def run_edit(path: str, old_text: str, new_text: str,
              cwd: Path = None) -> str:
     try:
         fp = safe_path(path, cwd)
-        text = fp.read_text(encoding="utf-8")
+        text = read_utf8(fp)
         if old_text not in text:
             return f"Error: text not found in {path}"
-        fp.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+        write_utf8(fp, text.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -528,7 +755,7 @@ def run_todo_write(todos: list) -> str:
     if error:
         return error
     CURRENT_TODOS = todos
-    print(f"  \033[33m[todo] updated {len(CURRENT_TODOS)} item(s)\033[0m")
+    ui_log("todo", f"updated {len(CURRENT_TODOS)} item(s)", "\033[33m")
     return f"Updated {len(CURRENT_TODOS)} todos"
 
 
@@ -547,16 +774,16 @@ class MessageBus:
                "content": content, "type": msg_type,
                "ts": time.time(), "metadata": metadata or {}}
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
+        with open(inbox, "a", encoding=ENCODING) as f:
             f.write(json.dumps(msg) + "\n")
-        terminal_print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
-                       f"({msg_type}) {content[:50]}\033[0m")
+        terminal_print(ui_log_text("bus", f"{from_agent} → {to_agent}: "
+                                   f"({msg_type}) {content[:50]}", "\033[33m"))
 
     def read_inbox(self, agent: str) -> list[dict]:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+        msgs = [json.loads(line) for line in read_utf8(inbox).splitlines()
                 if line.strip()]
         inbox.unlink()
         return msgs
@@ -619,7 +846,7 @@ IDLE_TIMEOUT = 60
 def scan_unclaimed_tasks() -> list[dict]:
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
+        task = json.loads(read_utf8(f))
         if (task.get("status") == "pending"
                 and not task.get("owner")
                 and can_start(task["id"])):
@@ -819,6 +1046,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     response = client.messages.create(
                         model=MODEL, system=system, messages=messages[-20:],
                         tools=sub_tools, max_tokens=8000)
+                    if hasattr(response, 'usage') and response.usage:
+                        ui_log("token", f"({name}) {_SESSION_TOKENS.format_last(response.usage)}")
+                        _SESSION_TOKENS.add(response.usage)
                 except Exception:
                     break
                 messages.append({"role": "assistant", "content": response.content})
@@ -949,7 +1179,8 @@ def permission_hook(block):
             if pattern in command:
                 return f"Permission denied: '{pattern}' is on the deny list"
         if any(token in command for token in DESTRUCTIVE):
-            print(f"\n\033[33m[permission] destructive command\033[0m")
+            print()
+            ui_log("permission", "destructive command", "\033[33m")
             print(f"  {command}")
             choice = input("  Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
@@ -961,7 +1192,8 @@ def permission_hook(block):
         except Exception:
             return f"Permission denied: path escapes workspace: {path}"
     if block.name.startswith("mcp__") and "deploy" in block.name:
-        print(f"\n\033[33m[permission] MCP destructive-looking tool: {block.name}\033[0m")
+        print()
+        ui_log("permission", f"MCP destructive-looking tool: {block.name}", "\033[33m")
         choice = input("  Allow? [y/N] ").strip().lower()
         if choice not in ("y", "yes"):
             return "Permission denied by user"
@@ -969,19 +1201,19 @@ def permission_hook(block):
 
 
 def log_hook(block):
-    print(f"\033[90m[HOOK] {block.name}\033[0m")
+    ui_log("hook", block.name)
     return None
 
 
 def large_output_hook(block, output):
     if len(str(output)) > 100000:
-        print(f"\033[33m[HOOK] large output from {block.name}: "
-              f"{len(str(output))} chars\033[0m")
+        ui_log("hook", f"large output from {block.name}: "
+               f"{len(str(output))} chars", "\033[33m")
     return None
 
 
 def user_prompt_hook(query: str):
-    print(f"\033[90m[HOOK] UserPromptSubmit: {WORKDIR}\033[0m")
+    ui_log("hook", f"UserPromptSubmit: {WORKDIR}")
     return None
 
 
@@ -993,7 +1225,7 @@ def stop_hook(messages: list):
             tool_count += sum(1 for item in content
                               if isinstance(item, dict)
                               and item.get("type") == "tool_result")
-    print(f"\033[90m[HOOK] Stop: {tool_count} tool result(s)\033[0m")
+    ui_log("hook", f"Stop: {tool_count} tool result(s)")
     return None
 
 
@@ -1071,6 +1303,9 @@ def spawn_subagent(description: str) -> str:
         response = client.messages.create(
             model=MODEL, system=SUB_SYSTEM, messages=messages,
             tools=SUB_TOOLS, max_tokens=8000)
+        if hasattr(response, 'usage') and response.usage:
+            ui_log("token", f"(子Agent) {_SESSION_TOKENS.format_last(response.usage)}")
+            _SESSION_TOKENS.add(response.usage)
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             break
@@ -1124,7 +1359,7 @@ def persist_large_output(tool_use_id: str, output: str) -> str:
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
     if not path.exists():
-        path.write_text(output)
+        write_utf8(path, output)
     return (f"<persisted-output>\nFull output: {path}\n"
             f"Preview:\n{output[:2000]}\n</persisted-output>")
 
@@ -1176,7 +1411,7 @@ def micro_compact(messages: list) -> list:
 def write_transcript(messages: list) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with path.open("w") as f:
+    with path.open("w", encoding=ENCODING) as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     return path
@@ -1191,19 +1426,22 @@ def summarize_history(messages: list) -> str:
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2000)
+    if hasattr(response, 'usage') and response.usage:
+        ui_log("token", f"(摘要) {_SESSION_TOKENS.format_last(response.usage)}")
+        _SESSION_TOKENS.add(response.usage)
     return extract_text(response.content) or "(empty summary)"
 
 
 def compact_history(messages: list) -> list:
     transcript = write_transcript(messages)
-    print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
+    ui_log("compact", f"transcript saved: {transcript}", "\033[36m")
     summary = summarize_history(messages)
     return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 
 
 def reactive_compact(messages: list) -> list:
     transcript = write_transcript(messages)
-    print(f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m")
+    ui_log("compact", f"transcript saved: {transcript}", "\033[31m")
     try:
         summary = summarize_history(messages)
     except Exception:
@@ -1239,8 +1477,8 @@ def with_retry(fn, state: RecoveryState):
             msg = str(e).lower()
             if "ratelimit" in name or "429" in msg:
                 delay = retry_delay(attempt)
-                print(f"  \033[33m[429] retry {attempt + 1}/{MAX_RETRIES} "
-                      f"after {delay:.1f}s\033[0m")
+                ui_log("429", f"retry {attempt + 1}/{MAX_RETRIES} "
+                       f"after {delay:.1f}s", "\033[33m")
                 time.sleep(delay)
                 continue
             if "overloaded" in name or "529" in msg or "overloaded" in msg:
@@ -1248,10 +1486,10 @@ def with_retry(fn, state: RecoveryState):
                 if state.consecutive_529 >= MAX_CONSECUTIVE_529 and FALLBACK_MODEL:
                     state.current_model = FALLBACK_MODEL
                     state.consecutive_529 = 0
-                    print(f"  \033[31m[529] switching to {FALLBACK_MODEL}\033[0m")
+                    ui_log("529", f"switching to {FALLBACK_MODEL}", "\033[31m")
                 delay = retry_delay(attempt)
-                print(f"  \033[33m[529] retry {attempt + 1}/{MAX_RETRIES} "
-                      f"after {delay:.1f}s\033[0m")
+                ui_log("529", f"retry {attempt + 1}/{MAX_RETRIES} "
+                       f"after {delay:.1f}s", "\033[33m")
                 time.sleep(delay)
                 continue
             raise
@@ -1312,7 +1550,7 @@ def start_background_task(block, handlers: dict) -> str:
             "status": "running",
         }
     threading.Thread(target=worker, daemon=True).start()
-    print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
+    ui_log("background", f"{bg_id}: {str(command)[:60]}", "\033[33m")
     return bg_id
 
 
@@ -1442,14 +1680,14 @@ def validate_cron(cron_expr: str) -> str | None:
 
 def save_durable_jobs():
     durable = [asdict(job) for job in scheduled_jobs.values() if job.durable]
-    DURABLE_PATH.write_text(json.dumps(durable, indent=2))
+    write_utf8(DURABLE_PATH, json.dumps(durable, indent=2))
 
 
 def load_durable_jobs():
     if not DURABLE_PATH.exists():
         return
     try:
-        for item in json.loads(DURABLE_PATH.read_text()):
+        for item in json.loads(read_utf8(DURABLE_PATH)):
             job = CronJob(**item)
             if not validate_cron(job.cron):
                 scheduled_jobs[job.id] = job
@@ -1499,7 +1737,7 @@ def cron_scheduler_loop():
                             if job.durable:
                                 save_durable_jobs()
                 except Exception as e:
-                    print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
+                    ui_log("cron", f"{job.id}: {e}", "\033[31m")
 
 
 def consume_cron_queue() -> list[CronJob]:
@@ -1630,7 +1868,7 @@ def connect_mcp(name: str) -> str:
     mcp_client = factory()
     mcp_clients[name] = mcp_client
     tool_names = [t["name"] for t in mcp_client.tools]
-    print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m")
+    ui_log("mcp", f"connected: {name} → {tool_names}", "\033[31m")
     return (f"Connected to MCP server '{name}'. "
             f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
 
@@ -1672,7 +1910,7 @@ def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
     task = create_task(subject, description, blockedBy)
     deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+    ui_log("create", f"{task.subject}{deps}", "\033[34m")
     return f"Created {task.id}: {task.subject}{deps}"
 
 
@@ -1908,7 +2146,7 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 def update_context(context: dict, messages: list) -> dict:
     memories = ""
     if MEMORY_INDEX.exists():
-        memories = MEMORY_INDEX.read_text()[:2000]
+        memories = read_utf8(MEMORY_INDEX)[:2000]
     return {
         "memories": memories,
         "connected_mcp": list(mcp_clients.keys()),
@@ -1951,7 +2189,7 @@ def inject_background_notifications(messages: list):
 def call_llm(messages: list, context: dict, tools: list,
              state: RecoveryState, max_tokens: int):
     system = assemble_system_prompt(context)
-    return with_retry(
+    response = with_retry(
         lambda: client.messages.create(
             model=state.current_model,
             system=system,
@@ -1959,6 +2197,11 @@ def call_llm(messages: list, context: dict, tools: list,
             tools=tools,
             max_tokens=max_tokens),
         state)
+    # 实时显示本轮 API token 消耗
+    if hasattr(response, 'usage') and response.usage:
+        ui_log("token", _SESSION_TOKENS.format_last(response.usage))
+        _SESSION_TOKENS.add(response.usage)
+    return response
 
 
 def agent_loop(messages: list, context: dict):
@@ -1966,6 +2209,7 @@ def agent_loop(messages: list, context: dict):
     tools, handlers = assemble_tool_pool()
     state = RecoveryState()
     max_tokens = DEFAULT_MAX_TOKENS
+    tool_idx = 0  # 本回合内工具调用序号，用于树状展示
 
     while True:
         # One cycle: inject scheduled/background work, prepare context, call
@@ -1974,7 +2218,7 @@ def agent_loop(messages: list, context: dict):
         for job in fired:
             messages.append({"role": "user",
                              "content": f"[Scheduled] {job.prompt}"})
-            print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
+            ui_log("cron", f"{job.prompt[:60]}", "\033[35m")
 
         inject_background_notifications(messages)
 
@@ -2002,7 +2246,7 @@ def agent_loop(messages: list, context: dict):
             if not state.has_escalated:
                 max_tokens = ESCALATED_MAX_TOKENS
                 state.has_escalated = True
-                print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
+                ui_log("max_tokens", f"retry with {max_tokens}", "\033[33m")
                 continue
             messages.append({"role": "assistant", "content": response.content})
             if state.recovery_count < MAX_RECOVERY_RETRIES:
@@ -2023,7 +2267,8 @@ def agent_loop(messages: list, context: dict):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"\033[36m> {block.name}\033[0m")
+            tool_idx += 1
+            print(ui_tool_call(tool_idx, block.name, block.input))
 
             if block.name == "compact":
                 messages[:] = compact_history(messages)
@@ -2051,7 +2296,7 @@ def agent_loop(messages: list, context: dict):
             handler = handlers.get(block.name)
             output = call_tool_handler(handler, block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
-            print(str(output)[:300])
+            ui_tool_output(output)
 
             if block.name == "todo_write":
                 rounds_since_todo = 0
@@ -2090,21 +2335,32 @@ def cron_autorun_loop(history: list, context: dict):
                 history.append({"role": "user",
                                 "content": f"[Scheduled] {job.prompt}"})
                 terminal_print(
-                    f"  \033[35m[cron auto] {job.prompt[:60]}\033[0m")
+                    ui_log_text("cron", f"{job.prompt[:60]}", "\033[35m"))
             agent_loop(history, context)
             context.update(update_context(context, history))
             print_turn_assistants(history, turn_start)
 
 
 def show_welcome():
-    """打印欢迎横幅和使用提示."""
+    """极简启动横幅，风格贴近 Claude Code。"""
+    inner_w = 42
+
+    def row(plain: str, styled: str = "") -> str:
+        content = styled or plain
+        pad = max(inner_w - _display_width(plain), 0)
+        left, right = pad // 2, pad - pad // 2
+        return ("  \033[90m│\033[0m" + " " * left + content + " " * right
+                + "\033[90m│\033[0m")
+
     print()
-    print("  \033[1;36m  +-- runcode --+")
-    print("  \033[1;36m  | \033[0m\033[2m  编程助手 \033[1;36m   |")
-    print("  \033[1;36m  +-------------+\033[0m")
-    print()
-    print(f"  \033[2m输入问题后按回车发送。行尾加 \\\\ 可换行继续输入。\033[0m")
-    print(f"  \033[2m\033[0m\033[33mq\033[0m\033[2m = 退出\033[0m")
+    print("  " + "\033[90m╭" + "─" * inner_w + "╮\033[0m")
+    print(row("runcode · AI 编程助手",
+              "\033[1;36mruncode\033[0m \033[2m· AI 编程助手\033[0m"))
+    print("  " + "\033[90m├" + "─" * inner_w + "┤\033[0m")
+    print(row("输入问题后按回车发送", "\033[2m输入问题后按回车发送\033[0m"))
+    print(row("行尾加 \\ 可换行继续输入", "\033[2m行尾加 \\ 可换行继续输入\033[0m"))
+    print(row("输入 q 退出", "\033[2m输入 \033[0m\033[33mq\033[0m\033[2m 退出\033[0m"))
+    print("  " + "\033[90m╰" + "─" * inner_w + "╯\033[0m")
     print()
 
 
@@ -2113,12 +2369,8 @@ def main():
     global TURN_COUNTER
     CLI_ACTIVE = True
 
-    # Configure stdout for Chinese/Unicode support on Windows
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(errors="replace")
-        except Exception:
-            pass
+    # 控制台切到 UTF-8，避免中文/特殊符号乱码
+    setup_console()
 
     if READLINE_AVAILABLE:
         histfile = os.path.expanduser("~/.runcode_history")
@@ -2144,7 +2396,7 @@ def main():
             # Multi-line input: lines ending with \ continue
             lines = []
             while True:
-                raw = input(ui_prompt() if not lines else "\033[2m  继续 > \033[0m")
+                raw = input(ui_prompt() if not lines else ui_continuation_prompt())
                 if raw.endswith("\\"):
                     lines.append(raw[:-1])
                     continue
@@ -2155,16 +2407,16 @@ def main():
             print()
             print(f"\n  {ui_separator('会话结束')}")
             elapsed = time.time() - _SESSION_START
-            print(f"  \033[2m{ui_session_stats()}\033[0m")
-            print(f"  \033[33m再见!\033[0m")
+            print(ui_session_stats())
+            print(f"  \033[32m再见!\033[0m")
             break
 
         stripped = query.strip()
         if stripped.lower() in ("q", "exit"):
             print(f"\n  {ui_separator('会话结束')}")
             elapsed = time.time() - _SESSION_START
-            print(f"  \033[2m{ui_session_stats()}\033[0m")
-            print(f"  \033[33m再见!\033[0m")
+            print(ui_session_stats())
+            print(f"  \033[32m再见!\033[0m")
             break
         if not stripped:
             TURN_COUNTER -= 1
@@ -2194,7 +2446,7 @@ def main():
             history.append({"role": "user",
                             "content": f"[收件箱]\n{inbox_text}"})
 
-        print(f"  \033[2m完成 ({ui_duration(elapsed)})\033[0m")
+        print(ui_turn_footer(elapsed))
         print()
 
     if READLINE_AVAILABLE:
